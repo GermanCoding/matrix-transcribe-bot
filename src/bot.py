@@ -89,6 +89,8 @@ class TranscriptBot:
     async def _setup_crypto(self):
         try:
             from mautrix.crypto import OlmMachine
+            # PgCryptoStore/PgCryptoStateStore support both PostgreSQL and SQLite via
+            # mautrix's async_db abstraction; here we use a local SQLite file.
             from mautrix.crypto.store.asyncpg import PgCryptoStore, PgCryptoStateStore
             from mautrix.types import TrustState
             from mautrix.util.async_db import Database
@@ -101,6 +103,8 @@ class TranscriptBot:
             )
             await db.start()
 
+            # account_id scopes the store to this bot's identity; pickle_key encrypts
+            # the serialised Olm account on disk and must remain stable across restarts.
             crypto_store = PgCryptoStore(str(self.client.mxid), "mxbot", db)
             state_store = PgCryptoStateStore(db)
             await crypto_store.open()
@@ -108,6 +112,7 @@ class TranscriptBot:
             self.client.state_store = state_store
 
             machine = OlmMachine(self.client, crypto_store, state_store)
+            # Allow sending to all devices without prior explicit verification (TOFU).
             machine.send_keys_min_trust = TrustState.UNVERIFIED
             await machine.load()
 
@@ -119,6 +124,7 @@ class TranscriptBot:
             logger.exception("Failed to set up E2E crypto, continuing without encryption")
 
     async def stop(self):
+        # client.stop() is synchronous — it cancels the syncing task.
         self.client.stop()
         await self.client.api.session.close()
 
