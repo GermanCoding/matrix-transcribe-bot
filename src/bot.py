@@ -5,22 +5,21 @@ import os
 import tempfile
 import time
 
-from nio import (
-    AsyncClient,
-    AsyncClientConfig,
-    InviteMemberEvent,
-    JoinResponse,
-    KeyVerificationCancel,
-    KeyVerificationKey,
-    KeyVerificationMac,
-    KeyVerificationStart,
-    LoginResponse,
-    RoomEncryptedAudio,
-    RoomMessageAudio,
-    SyncResponse,
-    ToDeviceError,
+from mautrix.client import Client
+from mautrix.client.state_store import MemoryStateStore
+from mautrix.crypto.attachments import decrypt_attachment
+from mautrix.errors import MatrixError
+from mautrix.types import (
+    EventType,
+    Membership,
+    MessageEvent,
+    MessageType,
+    StateEvent,
+    TextMessageEventContent,
+    RelatesTo,
+    InReplyTo,
 )
-from nio.crypto.attachments import decrypt_attachment
+from mautrix.types.primitive import EventID, RoomID
 
 logger = logging.getLogger(__name__)
 
@@ -34,21 +33,17 @@ class TranscriptBot:
         store_path: str,
         transcriber,
     ):
-        config = AsyncClientConfig(
-            store_sync_tokens=True,
-            encryption_enabled=True,
-        )
-        self.client = AsyncClient(
-            homeserver,
-            user_id,
-            store_path=store_path,
-            config=config,
-        )
         self.password = password
         self.store_path = store_path
         self.transcriber = transcriber
         self._startup_ms = int(time.time() * 1000)
         self._session_file = os.path.join(store_path, "session.json")
+
+        self.client = Client(
+            mxid=user_id,
+            base_url=homeserver,
+            state_store=MemoryStateStore(),
+        )
 
     async def start(self):
         if os.path.exists(self._session_file):
@@ -56,26 +51,19 @@ class TranscriptBot:
         else:
             await self._fresh_login()
 
+        await self._setup_crypto()
+
         logger.info(
-            "Logged in as %s (device %s)", self.client.user_id, self.client.device_id
+            "Logged in as %s (device %s)", self.client.mxid, self.client.device_id
         )
 
-        self.client.add_event_callback(self.on_audio_message, RoomMessageAudio)
-        self.client.add_event_callback(self.on_audio_message, RoomEncryptedAudio)
-        self.client.add_event_callback(self._on_invite, InviteMemberEvent)
-        self.client.add_response_callback(self._on_sync, SyncResponse)
-        self.client.add_to_device_callback(self._on_verify_start, KeyVerificationStart)
-        self.client.add_to_device_callback(self._on_verify_key, KeyVerificationKey)
-        self.client.add_to_device_callback(self._on_verify_mac, KeyVerificationMac)
-        self.client.add_to_device_callback(self._on_verify_cancel, KeyVerificationCancel)
+        self.client.add_event_handler(EventType.ROOM_MESSAGE, self.on_audio_message)
+        self.client.add_event_handler(EventType.ROOM_MEMBER, self._on_invite)
 
-        await self.client.sync_forever(timeout=30000)
+        await self.client.start(None)
 
     async def _fresh_login(self):
-        response = await self.client.login(self.password)
-        if not isinstance(response, LoginResponse):
-            logger.error("Login failed: %s", response)
-            raise SystemExit(1)
+        response = await self.client.login(password=self.password)
 
         os.makedirs(self.store_path, exist_ok=True)
         with open(self._session_file, "w") as f:
@@ -93,73 +81,84 @@ class TranscriptBot:
         with open(self._session_file) as f:
             session = json.load(f)
 
-        self.client.access_token = session["access_token"]
+        self.client.api.token = session["access_token"]
         self.client.device_id = session["device_id"]
-        self.client.user_id = session["user_id"]
-        self.client.load_store()
+        self.client.mxid = session["user_id"]
         logger.info("Restored session (device %s)", session["device_id"])
 
+    async def _setup_crypto(self):
+        try:
+            from mautrix.crypto import OlmMachine
+            from mautrix.crypto.store.asyncpg import PgCryptoStore, PgCryptoStateStore
+            from mautrix.types import TrustState
+            from mautrix.util.async_db import Database
+
+            os.makedirs(self.store_path, exist_ok=True)
+            db_path = os.path.join(self.store_path, "crypto.db")
+            db = Database.create(
+                f"sqlite:///{db_path}",
+                upgrade_table=PgCryptoStore.upgrade_table,
+            )
+            await db.start()
+
+            crypto_store = PgCryptoStore(str(self.client.mxid), "mxbot", db)
+            state_store = PgCryptoStateStore(db)
+            await crypto_store.open()
+
+            self.client.state_store = state_store
+
+            machine = OlmMachine(self.client, crypto_store, state_store)
+            machine.send_keys_min_trust = TrustState.UNVERIFIED
+            await machine.load()
+
+            self.client.crypto = machine
+            logger.info("E2E encryption enabled")
+        except ImportError:
+            logger.warning("E2E crypto dependencies not available, running without encryption")
+        except Exception:
+            logger.exception("Failed to set up E2E crypto, continuing without encryption")
+
     async def stop(self):
-        await self.client.close()
+        self.client.stop()
+        await self.client.api.session.close()
 
-    async def _on_sync(self, response):
-        """Trust all devices after each sync (TOFU)."""
-        for user_id in self.client.device_store.users:
-            for device in self.client.device_store.active_user_devices(user_id):
-                self.client.verify_device(device)
+    async def _on_invite(self, event: StateEvent):
+        if (
+            event.content.membership == Membership.INVITE
+            and event.state_key == self.client.mxid
+        ):
+            try:
+                await self.client.join_room_by_id(event.room_id)
+                logger.info("Joined room %s", event.room_id)
+            except MatrixError as e:
+                logger.error("Failed to join %s: %s", event.room_id, e)
 
-    async def _on_invite(self, room, event):
-        result = await self.client.join(room.room_id)
-        if isinstance(result, JoinResponse):
-            logger.info("Joined room %s", room.room_id)
-        else:
-            logger.error("Failed to join %s: %s", room.room_id, result)
+    async def on_audio_message(self, event: MessageEvent):
+        if not hasattr(event.content, "msgtype") or event.content.msgtype != MessageType.AUDIO:
+            return
 
-    async def _on_verify_start(self, event):
-        logger.info("Verification request from %s", event.sender)
-        if isinstance(event, KeyVerificationStart):
-            resp = await self.client.accept_key_verification(event.transaction_id)
-            if isinstance(resp, ToDeviceError):
-                logger.error("accept_key_verification failed: %s", resp)
-
-    async def _on_verify_key(self, event):
-        resp = await self.client.confirm_short_auth_string(event.transaction_id)
-        if isinstance(resp, ToDeviceError):
-            logger.error("confirm_short_auth_string failed: %s", resp)
-        else:
-            logger.info("Verification confirmed for %s", event.sender)
-
-    async def _on_verify_mac(self, event):
-        logger.info("Verification completed with %s", event.sender)
-
-    async def _on_verify_cancel(self, event):
-        logger.warning(
-            "Verification cancelled by %s: %s", event.sender, event.reason
-        )
-
-    async def on_audio_message(self, room, event):
         # Ignore own messages
-        if event.sender == self.client.user_id:
+        if event.sender == self.client.mxid:
             return
 
         # Ignore messages from before startup
-        if event.server_timestamp < self._startup_ms:
+        if event.timestamp < self._startup_ms:
             return
 
         logger.info(
             "Audio from %s in %s (%s)",
             event.sender,
-            room.room_id,
+            event.room_id,
             event.event_id,
         )
 
         # React with robot emoji
-        reaction_event_id = await self._react(room.room_id, event.event_id, "\U0001f916")
+        reaction_event_id = await self._react(event.room_id, event.event_id, "\U0001f916")
 
         try:
             audio_path = await self._download_media(event)
             if not audio_path:
-                await self._remove_reaction(room.room_id, reaction_event_id)
+                await self._remove_reaction(event.room_id, reaction_event_id)
                 return
 
             try:
@@ -175,78 +174,68 @@ class TranscriptBot:
             finally:
                 os.unlink(audio_path)
 
-            await self._remove_reaction(room.room_id, reaction_event_id)
+            await self._remove_reaction(event.room_id, reaction_event_id)
 
             if not text or not text.strip():
-                await self._reply(room.room_id, event.event_id, "No speech detected.")
+                await self._reply(event.room_id, event.event_id, "No speech detected.")
             else:
-                await self._reply(room.room_id, event.event_id, text)
+                await self._reply(event.room_id, event.event_id, text)
 
         except Exception:
             logger.exception("Transcription failed for %s", event.event_id)
-            await self._remove_reaction(room.room_id, reaction_event_id)
-            await self._react(room.room_id, event.event_id, "\u274c")
+            await self._remove_reaction(event.room_id, reaction_event_id)
+            await self._react(event.room_id, event.event_id, "\u274c")
 
-    async def _download_media(self, event):
-        content = event.source.get("content", {})
+    async def _download_media(self, event: MessageEvent):
+        content = event.content
 
-        if "file" in content:
-            mxc = content["file"]["url"]
+        if content.file:
+            mxc = content.file.url
         else:
-            mxc = event.url
+            mxc = content.url
 
-        response = await self.client.download(mxc)
-
-        if not hasattr(response, "body"):
-            logger.error("Failed to download media: %s", response)
+        try:
+            data = await self.client.download_media(mxc)
+        except Exception as e:
+            logger.error("Failed to download media: %s", e)
             return None
 
-        data = response.body
-
-        if "file" in content:
+        if content.file:
             data = decrypt_attachment(
                 data,
-                content["file"]["key"]["k"],
-                content["file"]["hashes"]["sha256"],
-                content["file"]["iv"],
+                content.file.key.key,
+                content.file.hashes["sha256"],
+                content.file.iv,
             )
 
-        body = content.get("body", "audio.ogg")
+        body = content.body or "audio.ogg"
         suffix = os.path.splitext(body)[1] or ".ogg"
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         tmp.write(data)
         tmp.close()
         return tmp.name
 
-    async def _react(self, room_id, event_id, emoji):
-        content = {
-            "m.relates_to": {
-                "rel_type": "m.annotation",
-                "event_id": event_id,
-                "key": emoji,
-            }
-        }
-        response = await self.client.room_send(
-            room_id, "m.reaction", content, ignore_unverified_devices=True
-        )
-        if hasattr(response, "event_id"):
-            return response.event_id
-        return None
+    async def _react(self, room_id: RoomID, event_id: EventID, emoji: str):
+        try:
+            return await self.client.react(room_id, event_id, emoji)
+        except MatrixError as e:
+            logger.warning("Failed to send reaction: %s", e)
+            return None
 
-    async def _remove_reaction(self, room_id, reaction_event_id):
+    async def _remove_reaction(self, room_id: RoomID, reaction_event_id: EventID):
         if reaction_event_id:
-            await self.client.room_redact(room_id, reaction_event_id)
+            try:
+                await self.client.redact(room_id, reaction_event_id)
+            except MatrixError as e:
+                logger.warning("Failed to redact reaction: %s", e)
 
-    async def _reply(self, room_id, event_id, text):
-        content = {
-            "msgtype": "m.text",
-            "body": text,
-            "m.relates_to": {
-                "m.in_reply_to": {
-                    "event_id": event_id,
-                }
-            },
-        }
-        await self.client.room_send(
-            room_id, "m.room.message", content, ignore_unverified_devices=True
+    async def _reply(self, room_id: RoomID, event_id: EventID, text: str):
+        content = TextMessageEventContent(
+            msgtype=MessageType.TEXT,
+            body=text,
+            relates_to=RelatesTo(
+                in_reply_to=InReplyTo(event_id=event_id),
+            ),
         )
+        await self.client.send_message_event(room_id, EventType.ROOM_MESSAGE, content)
+
