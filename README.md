@@ -2,7 +2,7 @@
 
 A self-hosted Matrix bot that transcribes audio messages into text.
 
-The Matrix integration is implemented in Go using [`mautrix`](https://github.com/mautrix/go), with full E2EE (end-to-end encryption) support. Transcription is handled by Python `faster-whisper` through a persistent bridge process.
+The Matrix integration is implemented in Go using [`mautrix`](https://github.com/mautrix/go), with full E2EE (end-to-end encryption) support. Transcription is handled by Python [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper).
 
 ## How it works
 
