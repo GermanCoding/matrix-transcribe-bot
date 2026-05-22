@@ -13,6 +13,7 @@ type Config struct {
 	UserID          string
 	Password        string
 	StorePath       string
+	PickleKey       []byte
 	WhisperModel    string
 	WhisperLanguage string
 	WhisperModelDir string
@@ -30,10 +31,14 @@ func LoadFromEnv() (*Config, error) {
 		WhisperLanguage: getenv("WHISPER_LANGUAGE", "es"),
 		WhisperModelDir: getenv("WHISPER_MODEL_DIR", "/app/models"),
 		PythonBin:       getenv("PYTHON_BIN", "python"),
+		PickleKey:       []byte(os.Getenv("PICKLE_KEY")),
 	}
 
 	if cfg.Homeserver == "" || cfg.UserID == "" || cfg.Password == "" {
 		return nil, errors.New("MATRIX_HOMESERVER, MATRIX_USER_ID, and MATRIX_PASSWORD are required")
+	}
+	if len(cfg.PickleKey) == 0 {
+		return nil, errors.New("PICKLE_KEY is required for E2EE (use a long random secret string)")
 	}
 
 	threads, err := strconv.Atoi(getenv("WHISPER_CPU_THREADS", "0"))
@@ -52,8 +57,9 @@ func LoadFromEnv() (*Config, error) {
 	return cfg, nil
 }
 
-func (c *Config) SessionFile() string {
-	return filepath.Join(c.StorePath, "session.json")
+// CryptoDB returns the path to the SQLite database used for E2EE key storage.
+func (c *Config) CryptoDB() string {
+	return filepath.Join(c.StorePath, "crypto.db")
 }
 
 func getenv(key, fallback string) string {

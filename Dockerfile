@@ -1,18 +1,26 @@
 FROM golang:1.24 AS go-builder
 
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        gcc \
+        libolm-dev \
+        libsqlite3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /src
-COPY go.mod .
+COPY go.mod go.sum .
 RUN go mod download
 
 COPY cmd/ cmd/
 COPY internal/ internal/
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/matrix-transcribe-bot ./cmd/bot
+RUN CGO_ENABLED=1 GOOS=linux go build -o /out/matrix-transcribe-bot ./cmd/bot
 
 FROM python:3.12-slim
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ffmpeg \
+        libolm3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
