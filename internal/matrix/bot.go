@@ -18,31 +18,69 @@ import (
 	"maunium.net/go/mautrix/id"
 )
 
+// authMode describes how the bot authenticates with the homeserver.
+type authMode int
+
+const (
+	authPassword authMode = iota // Use username + password login
+	authToken                    // Use a pre-existing access token
+)
+
 type Bot struct {
 	cfg       *config.Config
 	client    *mautrix.Client
 	crypto    *cryptohelper.CryptoHelper
 	bridge    *transcribe.Bridge
 	startupMS int64
+	auth      authMode
 }
 
 func NewBot(cfg *config.Config, bridge *transcribe.Bridge) (*Bot, error) {
-	client, err := mautrix.NewClient(cfg.Homeserver, "", "")
-	if err != nil {
-		return nil, err
+	var (
+		client *mautrix.Client
+		err    error
+		auth   authMode
+	)
+
+	if cfg.AccessToken != "" {
+		// Token auth: credentials are provided directly; skip the LoginAs flow.
+		auth = authToken
+		client, err = mautrix.NewClient(cfg.Homeserver, id.UserID(cfg.UserID), cfg.AccessToken)
+		if err != nil {
+			return nil, err
+		}
+		if cfg.DeviceID != "" {
+			client.DeviceID = id.DeviceID(cfg.DeviceID)
+		} else {
+			// Discover the device ID associated with this access token.
+			resp, wErr := client.Whoami(context.Background())
+			if wErr != nil {
+				return nil, fmt.Errorf("whoami failed (is MATRIX_ACCESS_TOKEN valid?): %w", wErr)
+			}
+			client.DeviceID = resp.DeviceID
+		}
+	} else {
+		// Password auth: delegate login and device-ID persistence to the crypto helper.
+		auth = authPassword
+		client, err = mautrix.NewClient(cfg.Homeserver, "", "")
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	helper, err := cryptohelper.NewCryptoHelper(client, cfg.PickleKey, cfg.CryptoDB())
 	if err != nil {
 		return nil, fmt.Errorf("init crypto helper: %w", err)
 	}
-	// LoginAs lets the crypto helper handle login and device-ID persistence
-	// so the same Olm identity (and its keys) is reused across restarts.
-	helper.LoginAs = &mautrix.ReqLogin{
-		Type:                     mautrix.AuthTypePassword,
-		Identifier:               mautrix.UserIdentifier{Type: mautrix.IdentifierTypeUser, User: cfg.UserID},
-		Password:                 cfg.Password,
-		InitialDeviceDisplayName: "matrix-transcribe-bot",
+	if auth == authPassword {
+		// LoginAs lets the crypto helper handle login and device-ID persistence
+		// so the same Olm identity (and its keys) is reused across restarts.
+		helper.LoginAs = &mautrix.ReqLogin{
+			Type:                     mautrix.AuthTypePassword,
+			Identifier:               mautrix.UserIdentifier{Type: mautrix.IdentifierTypeUser, User: cfg.UserID},
+			Password:                 cfg.Password,
+			InitialDeviceDisplayName: "matrix-transcribe-bot",
+		}
 	}
 	client.Crypto = helper
 
@@ -52,6 +90,7 @@ func NewBot(cfg *config.Config, bridge *transcribe.Bridge) (*Bot, error) {
 		crypto:    helper,
 		bridge:    bridge,
 		startupMS: time.Now().UnixMilli(),
+		auth:      auth,
 	}, nil
 }
 
@@ -68,6 +107,9 @@ func (b *Bot) Run(ctx context.Context) error {
 	b.crypto.Machine().ShareKeysMinTrust = id.TrustStateUnset
 
 	log.Printf("Logged in as %s (device %s)", b.client.UserID, b.client.DeviceID)
+
+	b.selfVerifyDevice(ctx)
+
 	b.registerHandlers()
 
 	errCh := make(chan error, 1)
@@ -95,6 +137,72 @@ func (b *Bot) registerHandlers() {
 	// re-dispatches them as EventMessage with SourceDecrypted set, so the same
 	// handler covers both code paths automatically.
 	syncer.OnEventType(event.EventMessage, b.onMessageEvent)
+}
+
+// selfVerifyDevice checks whether this device is cross-signed (verified) and
+// attempts to set up cross-signing + self-verify on first use when possible.
+// Failures are logged and non-fatal — the bot still works in unverified rooms.
+func (b *Bot) selfVerifyDevice(ctx context.Context) {
+	mach := b.crypto.Machine()
+	hasKeys, isVerified, err := mach.GetOwnVerificationStatus(ctx)
+	if err != nil {
+		log.Printf("Failed to check cross-signing status: %v", err)
+		return
+	}
+	if isVerified {
+		log.Printf("Device is cross-signed (verified)")
+		return
+	}
+	if hasKeys {
+		// Cross-signing exists on the account but this device is not yet signed.
+		// Signing it requires the private self-signing key which we only have when
+		// cross-signing was just set up in this process. The user must verify via
+		// another client or provide a recovery key.
+		log.Printf("Cross-signing is set up but this device is not self-verified; " +
+			"verify via another Matrix client or re-run after providing a recovery key")
+		return
+	}
+	// No cross-signing keys at all — generate them and self-sign this device.
+	log.Printf("No cross-signing keys found; setting up cross-signing...")
+	if err := b.setupCrossSigning(ctx); err != nil {
+		log.Printf("Failed to set up cross-signing: %v (continuing without self-verification)", err)
+		return
+	}
+	log.Printf("Cross-signing set up; device is now self-verified")
+}
+
+// setupCrossSigning generates cross-signing keys, uploads them to the server,
+// and self-signs this device so it appears verified.
+// For password auth it supplies UIA via the stored password; for token auth it
+// relies on the server accepting the request without interactive auth (which
+// is possible on some homeservers and when using MAS / OAuth sessions).
+func (b *Bot) setupCrossSigning(ctx context.Context) error {
+	mach := b.crypto.Machine()
+
+	var uiaCallback mautrix.UIACallback
+	if b.auth == authPassword {
+		uiaCallback = func(uiResp *mautrix.RespUserInteractive) interface{} {
+			return &mautrix.ReqUIAuthLogin{
+				BaseAuthData: mautrix.BaseAuthData{
+					Type:    mautrix.AuthTypePassword,
+					Session: uiResp.Session,
+				},
+				User:     b.client.UserID.String(),
+				Password: b.cfg.Password,
+			}
+		}
+	}
+
+	if _, _, err := mach.GenerateAndUploadCrossSigningKeys(ctx, uiaCallback, ""); err != nil {
+		return fmt.Errorf("generate and upload cross-signing keys: %w", err)
+	}
+	if err := mach.SignOwnDevice(ctx, mach.OwnIdentity()); err != nil {
+		return fmt.Errorf("sign own device: %w", err)
+	}
+	if err := mach.SignOwnMasterKey(ctx); err != nil {
+		return fmt.Errorf("sign own master key: %w", err)
+	}
+	return nil
 }
 
 func (b *Bot) onMemberEvent(ctx context.Context, evt *event.Event) {

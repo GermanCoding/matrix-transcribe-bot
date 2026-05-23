@@ -12,6 +12,8 @@ type Config struct {
 	Homeserver      string
 	UserID          string
 	Password        string
+	AccessToken     string // optional; use instead of Password for token-based auth
+	DeviceID        string // optional; for token auth, auto-fetched via /whoami if not set
 	StorePath       string
 	PickleKey       []byte
 	WhisperModel    string
@@ -26,6 +28,8 @@ func LoadFromEnv() (*Config, error) {
 		Homeserver:      os.Getenv("MATRIX_HOMESERVER"),
 		UserID:          os.Getenv("MATRIX_USER_ID"),
 		Password:        os.Getenv("MATRIX_PASSWORD"),
+		AccessToken:     os.Getenv("MATRIX_ACCESS_TOKEN"),
+		DeviceID:        os.Getenv("MATRIX_DEVICE_ID"),
 		StorePath:       getenv("STORE_PATH", "/app/store"),
 		WhisperModel:    getenv("WHISPER_MODEL", "large-v3"),
 		WhisperLanguage: getenv("WHISPER_LANGUAGE", "es"),
@@ -34,8 +38,11 @@ func LoadFromEnv() (*Config, error) {
 		PickleKey:       []byte(os.Getenv("PICKLE_KEY")),
 	}
 
-	if cfg.Homeserver == "" || cfg.UserID == "" || cfg.Password == "" {
-		return nil, errors.New("MATRIX_HOMESERVER, MATRIX_USER_ID, and MATRIX_PASSWORD are required")
+	if cfg.Homeserver == "" || cfg.UserID == "" {
+		return nil, errors.New("MATRIX_HOMESERVER and MATRIX_USER_ID are required")
+	}
+	if cfg.Password == "" && cfg.AccessToken == "" {
+		return nil, errors.New("either MATRIX_PASSWORD or MATRIX_ACCESS_TOKEN is required")
 	}
 	if len(cfg.PickleKey) == 0 {
 		return nil, errors.New("PICKLE_KEY is required for E2EE (use a long random secret string)")
