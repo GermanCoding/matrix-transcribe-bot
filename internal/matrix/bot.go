@@ -68,14 +68,6 @@ func NewBot(cfg *config.Config, bridge *transcribe.Bridge) (*Bot, error) {
 		}
 	}
 
-	if cfg.ResetCryptoStore {
-		dbPath := cfg.CryptoDB()
-		if err := os.Remove(dbPath); err != nil && !os.IsNotExist(err) {
-			return nil, fmt.Errorf("reset crypto store: %w", err)
-		}
-		log.Printf("Crypto store reset: deleted %s", dbPath)
-	}
-
 	helper, err := cryptohelper.NewCryptoHelper(client, cfg.PickleKey, cfg.CryptoDB())
 	if err != nil {
 		return nil, fmt.Errorf("init crypto helper: %w", err)
@@ -163,11 +155,18 @@ func (b *Bot) selfVerifyDevice(ctx context.Context) {
 	}
 	if hasKeys {
 		// Cross-signing exists on the account but this device is not yet signed.
-		// Signing it requires the private self-signing key which we only have when
-		// cross-signing was just set up in this process. The user must verify via
-		// another client or provide a recovery key.
+		if b.cfg.RecoveryKey != "" {
+			log.Printf("Cross-signing is set up but device is not verified; using recovery key to self-verify...")
+			if err := mach.VerifyWithRecoveryKey(ctx, b.cfg.RecoveryKey); err != nil {
+				log.Printf("Failed to self-verify with recovery key: %v (continuing without self-verification)", err)
+				return
+			}
+			log.Printf("Device self-verified successfully using recovery key")
+			return
+		}
+		// No recovery key provided — the user must verify via another client.
 		log.Printf("Cross-signing is set up but this device is not self-verified; " +
-			"verify via another Matrix client or re-run after providing a recovery key")
+			"set MATRIX_RECOVERY_KEY to self-verify automatically, or verify via another Matrix client")
 		return
 	}
 	// No cross-signing keys at all — generate them and self-sign this device.
@@ -241,6 +240,8 @@ func (b *Bot) onMessageEvent(ctx context.Context, evt *event.Event) {
 		return
 	}
 
+	log.Printf("Received audio message %s in room %s", evt.ID, evt.RoomID)
+
 	reactionID := b.react(evt.RoomID, evt.ID, "🤖")
 
 	path, err := b.downloadAudio(ctx, msg)
@@ -263,6 +264,8 @@ func (b *Bot) onMessageEvent(ctx context.Context, evt *event.Event) {
 	text = normalizeTranscript(text)
 	if err := b.reply(evt.RoomID, evt.ID, text); err != nil {
 		log.Printf("reply failed for %s: %v", evt.ID, err)
+	} else {
+		log.Printf("Sent transcription reply for %s in room %s", evt.ID, evt.RoomID)
 	}
 }
 
@@ -331,6 +334,7 @@ func (b *Bot) react(roomID id.RoomID, eventID id.EventID, key string) id.EventID
 		log.Printf("reaction failed: %v", err)
 		return ""
 	}
+	log.Printf("Sent reaction %s to %s in room %s", key, eventID, roomID)
 	return resp.EventID
 }
 

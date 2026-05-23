@@ -6,7 +6,7 @@ The Matrix integration is implemented in Go using [`mautrix`](https://github.com
 
 ## How it works
 
-1. A user sends `m.audio` or `m.video` in a room where the bot is present.
+1. A user sends an `m.audio` voice message in a room where the bot is present.
 2. The bot reacts with 🤖 while processing.
 3. The Go bot downloads and (if needed) decrypts the media from Matrix.
 4. The bot asks the Python bridge to transcribe with `faster-whisper`.
@@ -27,7 +27,7 @@ E2EE is enabled out of the box via `mautrix` and its `cryptohelper` package:
 On startup the bot checks whether the account already has cross-signing keys:
 
 - **No cross-signing keys**: The bot generates a new master key, self-signing key, and user-signing key, uploads them to the homeserver, and self-signs its own device so it shows as *verified* in other clients. For password-based login the upload is authenticated automatically; for token-based login it succeeds if the homeserver accepts the request without interactive auth (e.g. on MAS / OAuth2 sessions). If the upload fails the bot logs a warning and continues operating in an unverified state.
-- **Cross-signing already set up, device not yet verified**: The bot logs a message and continues. Verify it manually from another client, or start fresh with a new device.
+- **Cross-signing already set up, device not yet verified**: If `MATRIX_RECOVERY_KEY` is set, the bot fetches the private cross-signing keys from SSSS using the recovery key and self-signs the device automatically. If the recovery key is not provided, the bot logs a message and continues unverified.
 - **Cross-signing already set up, device verified**: Nothing to do.
 
 **Important:** `PICKLE_KEY` must be set before the first run and never changed afterwards. Changing it will corrupt the crypto store.
@@ -59,6 +59,7 @@ Environment variables:
 | `MATRIX_PASSWORD` | (required if no token) | Bot account password |
 | `MATRIX_ACCESS_TOKEN` | (required if no password) | Pre-existing access token (for SSO / MAS / device-code flows) |
 | `MATRIX_DEVICE_ID` | (auto via `/whoami`) | Device ID for the access token; auto-detected if not set |
+| `MATRIX_RECOVERY_KEY` | (optional) | Matrix recovery key; used to self-verify the device when cross-signing is already set up on the account |
 | `PICKLE_KEY` | (required) | Secret key for E2EE store encryption — generate once and keep stable |
 | `STORE_PATH` | `/app/store` | Directory for session and E2EE key storage |
 | `WHISPER_MODEL` | `large-v3` | faster-whisper model name |
