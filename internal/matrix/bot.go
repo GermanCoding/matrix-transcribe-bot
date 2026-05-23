@@ -68,6 +68,14 @@ func NewBot(cfg *config.Config, bridge *transcribe.Bridge) (*Bot, error) {
 		}
 	}
 
+	if cfg.ResetCryptoStore {
+		dbPath := cfg.CryptoDB()
+		if err := os.Remove(dbPath); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("reset crypto store: %w", err)
+		}
+		log.Printf("Crypto store reset: deleted %s", dbPath)
+	}
+
 	helper, err := cryptohelper.NewCryptoHelper(client, cfg.PickleKey, cfg.CryptoDB())
 	if err != nil {
 		return nil, fmt.Errorf("init crypto helper: %w", err)
@@ -259,7 +267,7 @@ func (b *Bot) onMessageEvent(ctx context.Context, evt *event.Event) {
 }
 
 func isSupportedMediaMessage(msg *event.MessageEventContent) bool {
-	return msg.MsgType == event.MsgAudio || msg.MsgType == event.MsgVideo
+	return msg.MsgType == event.MsgAudio
 }
 
 func normalizeTranscript(text string) string {

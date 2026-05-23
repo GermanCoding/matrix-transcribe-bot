@@ -9,33 +9,35 @@ import (
 )
 
 type Config struct {
-	Homeserver      string
-	UserID          string
-	Password        string
-	AccessToken     string // optional; use instead of Password for token-based auth
-	DeviceID        string // optional; for token auth, auto-fetched via /whoami if not set
-	StorePath       string
-	PickleKey       []byte
-	WhisperModel    string
-	WhisperLanguage string
-	WhisperModelDir string
-	WhisperThreads  int
-	PythonBin       string
+	Homeserver       string
+	UserID           string
+	Password         string
+	AccessToken      string // optional; use instead of Password for token-based auth
+	DeviceID         string // optional; for token auth, auto-fetched via /whoami if not set
+	StorePath        string
+	PickleKey        []byte
+	ResetCryptoStore bool // when true, the crypto DB is deleted before init
+	WhisperModel     string
+	WhisperLanguage  string
+	WhisperModelDir  string
+	WhisperThreads   int
+	PythonBin        string
 }
 
 func LoadFromEnv() (*Config, error) {
 	cfg := &Config{
-		Homeserver:      os.Getenv("MATRIX_HOMESERVER"),
-		UserID:          os.Getenv("MATRIX_USER_ID"),
-		Password:        os.Getenv("MATRIX_PASSWORD"),
-		AccessToken:     os.Getenv("MATRIX_ACCESS_TOKEN"),
-		DeviceID:        os.Getenv("MATRIX_DEVICE_ID"),
-		StorePath:       getenv("STORE_PATH", "/app/store"),
-		WhisperModel:    getenv("WHISPER_MODEL", "large-v3"),
-		WhisperLanguage: getenv("WHISPER_LANGUAGE", "es"),
-		WhisperModelDir: getenv("WHISPER_MODEL_DIR", "/app/models"),
-		PythonBin:       getenv("PYTHON_BIN", "python"),
-		PickleKey:       []byte(os.Getenv("PICKLE_KEY")),
+		Homeserver:       os.Getenv("MATRIX_HOMESERVER"),
+		UserID:           os.Getenv("MATRIX_USER_ID"),
+		Password:         os.Getenv("MATRIX_PASSWORD"),
+		AccessToken:      os.Getenv("MATRIX_ACCESS_TOKEN"),
+		DeviceID:         os.Getenv("MATRIX_DEVICE_ID"),
+		StorePath:        getenv("STORE_PATH", "/app/store"),
+		WhisperModel:     getenv("WHISPER_MODEL", "large-v3"),
+		WhisperLanguage:  getenv("WHISPER_LANGUAGE", "es"),
+		WhisperModelDir:  getenv("WHISPER_MODEL_DIR", "/app/models"),
+		PythonBin:        getenv("PYTHON_BIN", "python"),
+		PickleKey:        []byte(os.Getenv("PICKLE_KEY")),
+		ResetCryptoStore: os.Getenv("RESET_CRYPTO_STORE") == "true",
 	}
 
 	if cfg.Homeserver == "" || cfg.UserID == "" {
