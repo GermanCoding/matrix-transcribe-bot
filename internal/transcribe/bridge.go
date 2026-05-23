@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sync"
 
 	"github.com/GermanCoding/matrix-transcribe-bot/internal/config"
@@ -32,8 +31,10 @@ type bridgeResp struct {
 }
 
 func NewBridge(cfg *config.Config) (*Bridge, error) {
-	scriptPath := filepath.Join("src", "transcribe_bridge.py")
-	cmd := exec.Command(cfg.PythonBin, scriptPath)
+	// Run as a module so that Python resolves `from src.transcriber import …`
+	// relative to the working directory (i.e. /app inside the container) rather
+	// than relative to the script file's own directory.
+	cmd := exec.Command(cfg.PythonBin, "-m", "src.transcribe_bridge")
 	cmd.Env = append(os.Environ(),
 		"WHISPER_MODEL="+cfg.WhisperModel,
 		"WHISPER_LANGUAGE="+cfg.WhisperLanguage,
